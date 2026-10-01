@@ -5,6 +5,15 @@
 #include "Input/pad_thread.h"
 #include "Input/product_info.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
 cfg_input g_cfg_input;
 
 PadHandlerBase::PadHandlerBase(pad_handler type) : m_type(type)
@@ -971,72 +980,414 @@ void PadHandlerBase::get_orientation(const pad_ensemble& binding) const
 	device->update_orientation(pad->move_data);
 }
 
+namespace
+{
+	// Runtime tuning for the motion sensor fusion.
+	// Loaded from "<config dir>/ps_move_tuning.txt" ("key = value" per line, '#' starts a comment) and re-read about once per second,
+	// so the values can be changed while a game is running.
+	struct fusion_tuning
+	{
+		f32 gain = 0.0f;                 // 0 = gyro only (legacy behaviour). > 0 = use the accelerometer (gravity) to correct pitch and roll.
+		f32 accel_rejection = 10.0f;     // Fusion acceleration rejection in degrees (only used if gain > 0)
+		f32 accel_sign_x = 1.0f;         // Accelerometer axis signs (only used if gain > 0)
+		f32 accel_sign_y = 1.0f;
+		f32 accel_sign_z = 1.0f;
+		f32 gyro_scale = 1.0f;           // Multiplier for the angular velocity
+		f32 pitch_offset_deg = 0.0f;     // Constant pitch offset that is applied to the result
+		f32 bias_enable = 1.0f;          // 1 = estimate the gyro bias while the controller is held still and subtract it
+		f32 still_gyro_dev = 2.0f;       // Max deviation of the angular velocity from its average in degree/s to count as "still"
+		f32 still_accel_dev = 0.03f;     // Max deviation of the acceleration from its average in g to count as "still"
+		f32 still_time = 0.5f;           // Seconds the controller has to be still before the bias is acquired
+		f32 bias_max = 15.0f;            // Max plausible bias in degree/s
+		f32 bias_track_window = 1.5f;    // The bias is slowly tracked if the measured rate is within this window around the bias (degree/s)
+		f32 bias_track_tau = 2.0f;       // Time constant in seconds for slow bias tracking
+		f32 bias_reacquire_time = 2.0f;  // Seconds of stillness after which a bias outside of the track window is re-acquired
+		f32 log_enable = 1.0f;           // 1 = periodically log the sensor state
+		f32 log_interval = 2.0f;         // Seconds between log lines
+	};
+
+	struct fusion_state
+	{
+		bool filters_initialized = false;
+		bool bias_acquired = false;
+		bool is_still = false;
+		f32 gyro_lp[3]{};        // Low-passed angular velocity in degree/s
+		f32 accel_lp_fast[3]{};  // Low-passed acceleration in g (fast)
+		f32 accel_lp_slow[3]{};  // Low-passed acceleration in g (slow)
+		f32 bias[3]{};           // Estimated gyro bias in degree/s
+		f32 still_timer = 0.0f;
+		u32 generation = 0;
+		u64 last_log_time_us = 0;
+	};
+
+	std::recursive_mutex s_fusion_mutex;
+	fusion_tuning s_fusion_tuning{};
+	std::string s_fusion_tuning_text;
+	u64 s_fusion_tuning_time_us = 0;
+	u32 s_fusion_generation = 1;
+	std::unordered_map<const PadDevice*, fusion_state> s_fusion_states;
+
+	void fusion_parse_tuning(const std::string& text, fusion_tuning& tuning)
+	{
+		const std::pair<std::string_view, f32 fusion_tuning::*> fields[] =
+		{
+			{ "gain", &fusion_tuning::gain },
+			{ "accel_rejection", &fusion_tuning::accel_rejection },
+			{ "accel_sign_x", &fusion_tuning::accel_sign_x },
+			{ "accel_sign_y", &fusion_tuning::accel_sign_y },
+			{ "accel_sign_z", &fusion_tuning::accel_sign_z },
+			{ "gyro_scale", &fusion_tuning::gyro_scale },
+			{ "pitch_offset_deg", &fusion_tuning::pitch_offset_deg },
+			{ "bias_enable", &fusion_tuning::bias_enable },
+			{ "still_gyro_dev", &fusion_tuning::still_gyro_dev },
+			{ "still_accel_dev", &fusion_tuning::still_accel_dev },
+			{ "still_time", &fusion_tuning::still_time },
+			{ "bias_max", &fusion_tuning::bias_max },
+			{ "bias_track_window", &fusion_tuning::bias_track_window },
+			{ "bias_track_tau", &fusion_tuning::bias_track_tau },
+			{ "bias_reacquire_time", &fusion_tuning::bias_reacquire_time },
+			{ "log_enable", &fusion_tuning::log_enable },
+			{ "log_interval", &fusion_tuning::log_interval },
+		};
+
+		const auto trim = [](std::string str)
+		{
+			const usz first = str.find_first_not_of(" \t\r\n");
+			if (first == std::string::npos) return std::string();
+			const usz last = str.find_last_not_of(" \t\r\n");
+			return str.substr(first, last - first + 1);
+		};
+
+		usz pos = 0;
+		while (pos < text.size())
+		{
+			usz end = text.find('\n', pos);
+			if (end == std::string::npos) end = text.size();
+
+			std::string line = text.substr(pos, end - pos);
+			pos = end + 1;
+
+			if (const usz comment = line.find('#'); comment != std::string::npos)
+			{
+				line.erase(comment);
+			}
+
+			const usz separator = line.find('=');
+			if (separator == std::string::npos) continue;
+
+			const std::string key = trim(line.substr(0, separator));
+			const std::string value = trim(line.substr(separator + 1));
+			if (key.empty() || value.empty()) continue;
+
+			for (const auto& [name, member] : fields)
+			{
+				if (key == name)
+				{
+					tuning.*member = std::strtof(value.c_str(), nullptr);
+					break;
+				}
+			}
+		}
+	}
+
+	// Must be called with s_fusion_mutex locked
+	void fusion_update_tuning(u64 now_us)
+	{
+		if (s_fusion_tuning_time_us != 0 && (now_us - s_fusion_tuning_time_us) < 1'000'000)
+		{
+			return;
+		}
+
+		s_fusion_tuning_time_us = now_us ? now_us : 1;
+
+		std::string text;
+
+		if (fs::file file{ fs::get_config_dir(true) + "ps_move_tuning.txt", fs::read })
+		{
+			text = file.to_string();
+		}
+
+		if (text == s_fusion_tuning_text && s_fusion_generation > 1)
+		{
+			return;
+		}
+
+		s_fusion_tuning_text = text;
+
+		fusion_tuning tuning{};
+		fusion_parse_tuning(text, tuning);
+		s_fusion_tuning = tuning;
+		s_fusion_generation++;
+
+		input_log.notice("MoveFusion: tuning loaded: gain=%.3f, accel_rejection=%.1f, accel_sign=(%.0f, %.0f, %.0f), gyro_scale=%.3f, pitch_offset_deg=%.1f, bias_enable=%.0f, still_gyro_dev=%.2f, still_accel_dev=%.3f, still_time=%.2f, bias_max=%.1f, bias_track_window=%.2f, bias_track_tau=%.2f, bias_reacquire_time=%.2f",
+			tuning.gain, tuning.accel_rejection, tuning.accel_sign_x, tuning.accel_sign_y, tuning.accel_sign_z, tuning.gyro_scale, tuning.pitch_offset_deg, tuning.bias_enable,
+			tuning.still_gyro_dev, tuning.still_accel_dev, tuning.still_time, tuning.bias_max, tuning.bias_track_window, tuning.bias_track_tau, tuning.bias_reacquire_time);
+	}
+}
+
 void PadDevice::reset_orientation()
 {
+	std::lock_guard lock(s_fusion_mutex);
+
+	fusion_update_tuning(get_system_time());
+
 	// Initialize Fusion
 	ahrs = std::make_shared<FusionAhrs>();
 	FusionAhrsInitialise(ahrs.get());
 
 	FusionAhrsSettings settings = fusionAhrsDefaultSettings;
 	settings.convention = FusionConvention::FusionConventionEnu;
-	settings.gain = 0.0f; // If gain is set, the algorithm tries to adjust the orientation over time.
+	settings.gain = std::max(0.0f, s_fusion_tuning.gain); // If gain is set, the algorithm uses the accelerometer to adjust the orientation over time.
+
+	if (settings.gain > 0.0f)
+	{
+		settings.accelerationRejection = s_fusion_tuning.accel_rejection;
+	}
+
 	FusionAhrsSetSettings(ahrs.get(), &settings);
+
+	s_fusion_states[this].generation = s_fusion_generation;
 }
 
 void PadDevice::update_orientation(ps_move_data& move_data)
 {
-	if (!ahrs)
-	{
-		reset_orientation();
-	}
+	std::lock_guard lock(s_fusion_mutex);
 
 	// Get elapsed time since last update
 	const u64 now_us = get_system_time();
 	const f32 elapsed_sec = (last_ahrs_update_time_us == 0) ? 0.0f : ((now_us - last_ahrs_update_time_us) / 1'000'000.0f);
 	last_ahrs_update_time_us = now_us;
 
-	// The ps move handler's axis may differ from the Fusion axis, so we have to map them correctly.
-	// Don't ask how the axis work. It's basically been trial and error.
+	fusion_update_tuning(now_us);
+
+	if (!ahrs || s_fusion_states[this].generation != s_fusion_generation)
+	{
+		reset_orientation();
+	}
+
+	const fusion_tuning& tuning = s_fusion_tuning;
+	fusion_state& state = s_fusion_states[this];
+
+	// Sensor values in the sensor frame (x = right, y = forward, z = up)
+	// accel: g, gyro: degree/s (x = pitch up, y = roll right, z = yaw left)
+	const f32 accel[3] =
+	{
+		move_data.accelerometer.x(),
+		move_data.accelerometer.y(),
+		move_data.accelerometer.z()
+	};
+
+	f32 gyro[3] =
+	{
+		PadHandlerBase::rad_to_degree(move_data.gyro.x()),
+		PadHandlerBase::rad_to_degree(move_data.gyro.y()),
+		PadHandlerBase::rad_to_degree(move_data.gyro.z())
+	};
+
+	// Estimate the gyro bias while the controller is held still.
+	// Without this, the constant sensor error is integrated and the orientation drifts by several degrees per second.
+	const f32 filter_dt = std::clamp(elapsed_sec, 0.0f, 0.05f);
+
+	if (!state.filters_initialized)
+	{
+		for (int i = 0; i < 3; i++)
+		{
+			state.gyro_lp[i] = gyro[i];
+			state.accel_lp_fast[i] = accel[i];
+			state.accel_lp_slow[i] = accel[i];
+		}
+		state.filters_initialized = true;
+	}
+
+	const f32 alpha_fast = filter_dt / (0.25f + filter_dt);
+	const f32 alpha_slow = filter_dt / (1.0f + filter_dt);
+
+	f32 gyro_dev = 0.0f;
+	f32 gyro_abs = 0.0f;
+	f32 accel_dev = 0.0f;
+	f32 bias_error = 0.0f;
+
+	for (int i = 0; i < 3; i++)
+	{
+		state.gyro_lp[i] += (gyro[i] - state.gyro_lp[i]) * alpha_fast;
+		state.accel_lp_fast[i] += (accel[i] - state.accel_lp_fast[i]) * alpha_fast;
+		state.accel_lp_slow[i] += (accel[i] - state.accel_lp_slow[i]) * alpha_slow;
+
+		gyro_dev = std::max(gyro_dev, std::abs(gyro[i] - state.gyro_lp[i]));
+		gyro_abs = std::max(gyro_abs, std::abs(state.gyro_lp[i]));
+		accel_dev = std::max(accel_dev, std::abs(accel[i] - state.accel_lp_fast[i]));
+		accel_dev = std::max(accel_dev, std::abs(state.accel_lp_fast[i] - state.accel_lp_slow[i]));
+		bias_error = std::max(bias_error, std::abs(state.gyro_lp[i] - state.bias[i]));
+	}
+
+	const f32 accel_norm = std::sqrt(accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]);
+
+	state.is_still = gyro_dev < tuning.still_gyro_dev && accel_dev < tuning.still_accel_dev && gyro_abs < tuning.bias_max && std::abs(accel_norm - 1.0f) < 0.2f;
+
+	if (state.is_still)
+	{
+		state.still_timer += filter_dt;
+	}
+	else
+	{
+		state.still_timer = 0.0f;
+	}
+
+	if (tuning.bias_enable > 0.5f)
+	{
+		if (state.is_still && state.still_timer >= tuning.still_time)
+		{
+			if (!state.bias_acquired)
+			{
+				// Initial acquisition
+				for (int i = 0; i < 3; i++)
+				{
+					state.bias[i] = state.gyro_lp[i];
+				}
+				state.bias_acquired = true;
+			}
+			else if (bias_error < tuning.bias_track_window)
+			{
+				// Slowly track the bias (it changes with the temperature)
+				const f32 alpha = filter_dt / (std::max(0.05f, tuning.bias_track_tau) + filter_dt);
+				for (int i = 0; i < 3; i++)
+				{
+					state.bias[i] += (state.gyro_lp[i] - state.bias[i]) * alpha;
+				}
+			}
+			else if (state.still_timer >= tuning.bias_reacquire_time)
+			{
+				// The bias seems to be wrong. Acquire it again.
+				const f32 alpha = filter_dt / (0.5f + filter_dt);
+				for (int i = 0; i < 3; i++)
+				{
+					state.bias[i] += (state.gyro_lp[i] - state.bias[i]) * alpha;
+				}
+			}
+		}
+
+		for (int i = 0; i < 3; i++)
+		{
+			gyro[i] -= state.bias[i];
+		}
+	}
+
+	for (int i = 0; i < 3; i++)
+	{
+		gyro[i] *= tuning.gyro_scale;
+	}
+
 	ensure(ahrs->convention == FusionConvention::FusionConventionEnu); // East-North-Up
 
-	const FusionVector accelerometer{
-		.axis {
-			.x = -move_data.accelerometer.x(),
-			.y = +move_data.accelerometer.y(),
-			.z = +move_data.accelerometer.z()
-		}
-	};
+	const bool use_gravity = tuning.gain > 0.0f;
 
-	const FusionVector gyroscope{
-		.axis {
-			.x = +PadHandlerBase::rad_to_degree(move_data.gyro.x()),
-			.y = +PadHandlerBase::rad_to_degree(move_data.gyro.z()),
-			.z = -PadHandlerBase::rad_to_degree(move_data.gyro.y())
-		}
-	};
-
+	FusionVector accelerometer {};
+	FusionVector gyroscope {};
 	FusionVector magnetometer {};
 
-	if (move_data.magnetometer_enabled)
+	if (use_gravity)
 	{
-		magnetometer = FusionVector{
+		// Feed Fusion with a consistent right-handed sensor frame (x = right, y = forward, z = up).
+		// The accelerometer is used to keep pitch and roll in place.
+		accelerometer = FusionVector{
 			.axis {
-				.x = move_data.magnetometer.x(),
-				.y = move_data.magnetometer.y(),
-				.z = move_data.magnetometer.z()
+				.x = accel[0] * tuning.accel_sign_x,
+				.y = accel[1] * tuning.accel_sign_y,
+				.z = accel[2] * tuning.accel_sign_z
 			}
 		};
+
+		gyroscope = FusionVector{
+			.axis {
+				.x = gyro[0],
+				.y = gyro[1],
+				.z = gyro[2]
+			}
+		};
+	}
+	else
+	{
+		// Legacy mapping: gyro only.
+		// The ps move handler's axis may differ from the Fusion axis, so we have to map them correctly.
+		accelerometer = FusionVector{
+			.axis {
+				.x = -accel[0],
+				.y = +accel[1],
+				.z = +accel[2]
+			}
+		};
+
+		gyroscope = FusionVector{
+			.axis {
+				.x = +gyro[0],
+				.y = +gyro[2],
+				.z = -gyro[1]
+			}
+		};
+
+		if (move_data.magnetometer_enabled)
+		{
+			magnetometer = FusionVector{
+				.axis {
+					.x = move_data.magnetometer.x(),
+					.y = move_data.magnetometer.y(),
+					.z = move_data.magnetometer.z()
+				}
+			};
+		}
 	}
 
 	// Update Fusion
 	FusionAhrsSetSamplePeriod(ahrs.get(), elapsed_sec);
 	FusionAhrsUpdate(ahrs.get(), gyroscope, accelerometer, magnetometer);
 
-	// Get quaternion
+	// Get quaternion (w, x, y, z)
 	const FusionQuaternion quaternion = FusionAhrsGetQuaternion(ahrs.get());
-	move_data.quaternion[0] = quaternion.array[1];
-	move_data.quaternion[1] = quaternion.array[2];
-	move_data.quaternion[2] = quaternion.array[3];
-	move_data.quaternion[3] = quaternion.array[0];
+
+	f32 qw = quaternion.array[0];
+	f32 qx = quaternion.array[1];
+	f32 qy = quaternion.array[2];
+	f32 qz = quaternion.array[3];
+
+	if (use_gravity)
+	{
+		// Convert from the z-up sensor frame to the frame of the legacy mapping (x = right, y = up, z = backward)
+		const f32 y = qy;
+		qy = qz;
+		qz = -y;
+	}
+
+	if (tuning.pitch_offset_deg != 0.0f)
+	{
+		// Rotate around the x axis of the world
+		const f32 half_angle = PadHandlerBase::degree_to_rad(tuning.pitch_offset_deg) * 0.5f;
+		const f32 cw = std::cos(half_angle);
+		const f32 sx = std::sin(half_angle);
+		const f32 w = cw * qw - sx * qx;
+		const f32 x = cw * qx + sx * qw;
+		const f32 y = cw * qy - sx * qz;
+		const f32 z = cw * qz + sx * qy;
+		qw = w;
+		qx = x;
+		qy = y;
+		qz = z;
+	}
+
+	move_data.quaternion[0] = qx;
+	move_data.quaternion[1] = qy;
+	move_data.quaternion[2] = qz;
+	move_data.quaternion[3] = qw;
 	move_data.update_orientation(elapsed_sec);
+
+	if (tuning.log_enable > 0.5f && (now_us - state.last_log_time_us) >= static_cast<u64>(std::max(0.1f, tuning.log_interval) * 1'000'000.0f))
+	{
+		state.last_log_time_us = now_us;
+
+		input_log.notice("MoveFusion: player=%d, gravity=%d, still=%d (%.2fs), bias_acquired=%d, accel=(%.3f, %.3f, %.3f) |%.3f|, gyro_raw_lp=(%.2f, %.2f, %.2f), bias=(%.2f, %.2f, %.2f), gyro_dev=%.2f, accel_dev=%.3f, quat=(%.3f, %.3f, %.3f, %.3f)",
+			static_cast<u32>(player_id), static_cast<u32>(use_gravity), static_cast<u32>(state.is_still), state.still_timer, static_cast<u32>(state.bias_acquired),
+			accel[0], accel[1], accel[2], accel_norm,
+			state.gyro_lp[0], state.gyro_lp[1], state.gyro_lp[2],
+			state.bias[0], state.bias[1], state.bias[2],
+			gyro_dev, accel_dev, qx, qy, qz, qw);
+	}
 }
