@@ -170,8 +170,8 @@ void psmove_calibration_get_usb_accel_values(const reports::ps_move_calibration_
 	device.calibration.accel_z_factor = 2.0f / static_cast<float>(z2 - z1);
 
 	device.calibration.accel_x_offset = -(device.calibration.accel_x_factor * static_cast<float>(x1)) - 1.0f;
-	device.calibration.accel_y_offset = -(device.calibration.accel_y_factor * static_cast<float>(x1)) - 1.0f;
-	device.calibration.accel_z_offset = -(device.calibration.accel_z_factor * static_cast<float>(x1)) - 1.0f;
+	device.calibration.accel_y_offset = -(device.calibration.accel_y_factor * static_cast<float>(y1)) - 1.0f;
+	device.calibration.accel_z_offset = -(device.calibration.accel_z_factor * static_cast<float>(z1)) - 1.0f;
 }
 
 void psmove_calibration_get_usb_gyro_values(const reports::ps_move_calibration_blob& calibration, ps_move_device& device)
@@ -199,9 +199,10 @@ void psmove_calibration_get_usb_gyro_values(const reports::ps_move_calibration_b
 		device.calibration.gyro_x_gain = factor / static_cast<float>(x);
 		device.calibration.gyro_y_gain = factor / static_cast<float>(y);
 		device.calibration.gyro_z_gain = factor / static_cast<float>(z);
-		device.calibration.gyro_x_offset = 0;
-		device.calibration.gyro_y_offset = 0;
-		device.calibration.gyro_z_offset = 0;
+		// Subtract the factory bias (sensor readings at 0 rpm)
+		device.calibration.gyro_x_offset = static_cast<f32>(bx);
+		device.calibration.gyro_y_offset = static_cast<f32>(by);
+		device.calibration.gyro_z_offset = static_cast<f32>(bz);
 		break;
 	}
 	case ps_move_model::ZCM2:

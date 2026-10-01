@@ -288,7 +288,11 @@ void ps_move_handler::check_add_device(hid_device* hidDevice, hid_enumerated_dev
 
 	ps_move_calibration_blob calibration {};
 
-	for (int i = 0; i < 2; i++)
+	// The ZCM1 calibration consists of 3 blocks, the ZCM2 calibration of 2 blocks.
+	// The device returns the next block on each read, so we have to read all of them.
+	const int num_calibration_blocks = device->model == ps_move_model::ZCM1 ? 3 : 2;
+
+	for (int i = 0; i < num_calibration_blocks; i++)
 	{
 		std::array<u8, PSMOVE_CALIBRATION_SIZE> cal {};
 		cal[0] = 0x10;
