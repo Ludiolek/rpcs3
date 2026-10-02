@@ -6,8 +6,11 @@
 #include "Input/product_info.h"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -1002,6 +1005,9 @@ namespace
 		f32 bias_track_window = 1.5f;    // The bias is slowly tracked if the measured rate is within this window around the bias (degree/s)
 		f32 bias_track_tau = 2.0f;       // Time constant in seconds for slow bias tracking
 		f32 bias_reacquire_time = 2.0f;  // Seconds of stillness after which a bias outside of the track window is re-acquired
+		f32 bias_store = 1.0f;           // 1 = remember the bias per controller and use it right away when the controller connects again
+		f32 bias_store_still_time = 3.0f; // Seconds the controller has to be still before the bias is saved
+		f32 bias_store_interval = 30.0f; // Min seconds between two saves
 		f32 log_enable = 1.0f;           // 1 = periodically log the sensor state
 		f32 log_interval = 2.0f;         // Seconds between log lines
 	};
@@ -1010,14 +1016,18 @@ namespace
 	{
 		bool filters_initialized = false;
 		bool bias_acquired = false;
+		bool bias_stored = false;
 		bool is_still = false;
+		std::string id;          // Controller ID (serial) used to store the bias
 		f32 gyro_lp[3]{};        // Low-passed angular velocity in degree/s
 		f32 accel_lp_fast[3]{};  // Low-passed acceleration in g (fast)
 		f32 accel_lp_slow[3]{};  // Low-passed acceleration in g (slow)
 		f32 bias[3]{};           // Estimated gyro bias in degree/s
+		f32 stored_bias[3]{};    // Last saved or loaded gyro bias in degree/s
 		f32 still_timer = 0.0f;
 		u32 generation = 0;
 		u64 last_log_time_us = 0;
+		u64 last_store_time_us = 0;
 	};
 
 	std::recursive_mutex s_fusion_mutex;
@@ -1026,6 +1036,43 @@ namespace
 	u64 s_fusion_tuning_time_us = 0;
 	u32 s_fusion_generation = 1;
 	std::unordered_map<const PadDevice*, fusion_state> s_fusion_states;
+
+	std::string fusion_trim(const std::string& str)
+	{
+		const usz first = str.find_first_not_of(" \t\r\n");
+		if (first == std::string::npos) return std::string();
+		const usz last = str.find_last_not_of(" \t\r\n");
+		return str.substr(first, last - first + 1);
+	}
+
+	// Calls func(key, value) for each "key = value" line. '#' starts a comment.
+	template <typename F>
+	void fusion_parse_lines(const std::string& text, F&& func)
+	{
+		usz pos = 0;
+		while (pos < text.size())
+		{
+			usz end = text.find('\n', pos);
+			if (end == std::string::npos) end = text.size();
+
+			std::string line = text.substr(pos, end - pos);
+			pos = end + 1;
+
+			if (const usz comment = line.find('#'); comment != std::string::npos)
+			{
+				line.erase(comment);
+			}
+
+			const usz separator = line.find('=');
+			if (separator == std::string::npos) continue;
+
+			const std::string key = fusion_trim(line.substr(0, separator));
+			const std::string value = fusion_trim(line.substr(separator + 1));
+			if (key.empty() || value.empty()) continue;
+
+			func(key, value);
+		}
+	}
 
 	void fusion_parse_tuning(const std::string& text, fusion_tuning& tuning)
 	{
@@ -1046,39 +1093,15 @@ namespace
 			{ "bias_track_window", &fusion_tuning::bias_track_window },
 			{ "bias_track_tau", &fusion_tuning::bias_track_tau },
 			{ "bias_reacquire_time", &fusion_tuning::bias_reacquire_time },
+			{ "bias_store", &fusion_tuning::bias_store },
+			{ "bias_store_still_time", &fusion_tuning::bias_store_still_time },
+			{ "bias_store_interval", &fusion_tuning::bias_store_interval },
 			{ "log_enable", &fusion_tuning::log_enable },
 			{ "log_interval", &fusion_tuning::log_interval },
 		};
 
-		const auto trim = [](std::string str)
+		fusion_parse_lines(text, [&](const std::string& key, const std::string& value)
 		{
-			const usz first = str.find_first_not_of(" \t\r\n");
-			if (first == std::string::npos) return std::string();
-			const usz last = str.find_last_not_of(" \t\r\n");
-			return str.substr(first, last - first + 1);
-		};
-
-		usz pos = 0;
-		while (pos < text.size())
-		{
-			usz end = text.find('\n', pos);
-			if (end == std::string::npos) end = text.size();
-
-			std::string line = text.substr(pos, end - pos);
-			pos = end + 1;
-
-			if (const usz comment = line.find('#'); comment != std::string::npos)
-			{
-				line.erase(comment);
-			}
-
-			const usz separator = line.find('=');
-			if (separator == std::string::npos) continue;
-
-			const std::string key = trim(line.substr(0, separator));
-			const std::string value = trim(line.substr(separator + 1));
-			if (key.empty() || value.empty()) continue;
-
 			for (const auto& [name, member] : fields)
 			{
 				if (key == name)
@@ -1087,7 +1110,7 @@ namespace
 					break;
 				}
 			}
-		}
+		});
 	}
 
 	// Must be called with s_fusion_mutex locked
@@ -1119,10 +1142,145 @@ namespace
 		s_fusion_tuning = tuning;
 		s_fusion_generation++;
 
-		input_log.notice("MoveFusion: tuning loaded: gain=%.3f, accel_rejection=%.1f, accel_sign=(%.0f, %.0f, %.0f), gyro_scale=%.3f, pitch_offset_deg=%.1f, bias_enable=%.0f, still_gyro_dev=%.2f, still_accel_dev=%.3f, still_time=%.2f, bias_max=%.1f, bias_track_window=%.2f, bias_track_tau=%.2f, bias_reacquire_time=%.2f",
+		input_log.notice("MoveFusion: tuning loaded: gain=%.3f, accel_rejection=%.1f, accel_sign=(%.0f, %.0f, %.0f), gyro_scale=%.3f, pitch_offset_deg=%.1f, bias_enable=%.0f, still_gyro_dev=%.2f, still_accel_dev=%.3f, still_time=%.2f, bias_max=%.1f, bias_track_window=%.2f, bias_track_tau=%.2f, bias_reacquire_time=%.2f, bias_store=%.0f, bias_store_still_time=%.1f, bias_store_interval=%.0f",
 			tuning.gain, tuning.accel_rejection, tuning.accel_sign_x, tuning.accel_sign_y, tuning.accel_sign_z, tuning.gyro_scale, tuning.pitch_offset_deg, tuning.bias_enable,
-			tuning.still_gyro_dev, tuning.still_accel_dev, tuning.still_time, tuning.bias_max, tuning.bias_track_window, tuning.bias_track_tau, tuning.bias_reacquire_time);
+			tuning.still_gyro_dev, tuning.still_accel_dev, tuning.still_time, tuning.bias_max, tuning.bias_track_window, tuning.bias_track_tau, tuning.bias_reacquire_time,
+			tuning.bias_store, tuning.bias_store_still_time, tuning.bias_store_interval);
 	}
+
+	// The gyro bias of each controller is stored in "<config dir>/ps_move_gyro_bias.txt" ("id = x y z" in degree/s per line),
+	// so it can be used right away when the controller connects instead of waiting until the controller is held still.
+	// The values are relative to the factory calibration that the PS Move handler applies.
+	std::string fusion_bias_file_path()
+	{
+		return fs::get_config_dir(true) + "ps_move_gyro_bias.txt";
+	}
+
+	std::map<std::string, std::array<f32, 3>> fusion_read_stored_biases()
+	{
+		std::map<std::string, std::array<f32, 3>> biases;
+		std::string text;
+
+		if (fs::file file{ fusion_bias_file_path(), fs::read })
+		{
+			text = file.to_string();
+		}
+
+		fusion_parse_lines(text, [&biases](const std::string& id, const std::string& value)
+		{
+			std::array<f32, 3> bias{};
+			const char* str = value.c_str();
+
+			for (f32& axis : bias)
+			{
+				char* str_end = nullptr;
+				axis = std::strtof(str, &str_end);
+
+				if (str_end == str || !std::isfinite(axis))
+				{
+					return;
+				}
+
+				str = str_end;
+			}
+
+			biases[id] = bias;
+		});
+
+		return biases;
+	}
+
+	// Must be called with s_fusion_mutex locked
+	bool fusion_store_bias(const std::string& id, const f32 (&bias)[3])
+	{
+		std::map<std::string, std::array<f32, 3>> biases = fusion_read_stored_biases();
+		biases[id] = { bias[0], bias[1], bias[2] };
+
+		std::string text =
+			"# PS Move gyro bias per controller in degree/s, measured by RPCS3 while the controller was held still.\n"
+			"# It is used right away when the controller connects, so the controller does not have to be held still at the start.\n"
+			"# Delete a line (or this file) to measure from scratch.\n";
+
+		for (const auto& [stored_id, stored_bias] : biases)
+		{
+			text += fmt::format("%s = %.3f %.3f %.3f\n", stored_id, stored_bias[0], stored_bias[1], stored_bias[2]);
+		}
+
+		fs::file file{ fusion_bias_file_path(), fs::rewrite };
+		return file && file.write(text.data(), text.size()) == text.size();
+	}
+}
+
+// Called by the PS Move handler when a controller connects.
+// The ID is used to remember the gyro bias of each controller.
+void ps_move_set_fusion_device_id(const PadDevice* device, std::string_view serial)
+{
+	if (!device) return;
+
+	std::string id;
+	for (const char c : serial)
+	{
+		if (std::isalnum(static_cast<unsigned char>(c)))
+		{
+			id += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+	}
+
+	std::lock_guard lock(s_fusion_mutex);
+
+	fusion_update_tuning(get_system_time());
+
+	fusion_state& state = s_fusion_states[device];
+
+	if (state.id == id)
+	{
+		return;
+	}
+
+	// A different controller uses this device slot now. Forget the bias of the previous one.
+	state.id = id;
+	state.bias_acquired = false;
+	state.bias_stored = false;
+	state.last_store_time_us = 0;
+
+	for (int i = 0; i < 3; i++)
+	{
+		state.bias[i] = 0.0f;
+		state.stored_bias[i] = 0.0f;
+	}
+
+	if (id.empty() || s_fusion_tuning.bias_store <= 0.5f)
+	{
+		return;
+	}
+
+	const std::map<std::string, std::array<f32, 3>> biases = fusion_read_stored_biases();
+	const auto it = biases.find(id);
+
+	if (it == biases.end())
+	{
+		input_log.notice("MoveFusion: no saved gyro bias for controller %s yet. Hold it still for a few seconds to measure it.", id);
+		return;
+	}
+
+	const std::array<f32, 3>& bias = it->second;
+
+	if (std::abs(bias[0]) >= s_fusion_tuning.bias_max || std::abs(bias[1]) >= s_fusion_tuning.bias_max || std::abs(bias[2]) >= s_fusion_tuning.bias_max)
+	{
+		input_log.warning("MoveFusion: ignoring implausible saved gyro bias for controller %s: (%.2f, %.2f, %.2f)", id, bias[0], bias[1], bias[2]);
+		return;
+	}
+
+	for (int i = 0; i < 3; i++)
+	{
+		state.bias[i] = bias[i];
+		state.stored_bias[i] = bias[i];
+	}
+
+	state.bias_acquired = true;
+	state.bias_stored = true;
+
+	input_log.notice("MoveFusion: using saved gyro bias for controller %s: (%.2f, %.2f, %.2f)", id, bias[0], bias[1], bias[2]);
 }
 
 void PadDevice::reset_orientation()
@@ -1266,6 +1424,39 @@ void PadDevice::update_orientation(ps_move_data& move_data)
 			}
 		}
 
+		// Save the bias once it has settled, so it can be used right away the next time the controller connects
+		if (tuning.bias_store > 0.5f && !state.id.empty() && state.bias_acquired && state.is_still &&
+			state.still_timer >= tuning.bias_store_still_time && bias_error < tuning.bias_track_window &&
+			(state.last_store_time_us == 0 || (now_us - state.last_store_time_us) >= static_cast<u64>(std::max(1.0f, tuning.bias_store_interval) * 1'000'000.0f)))
+		{
+			state.last_store_time_us = now_us;
+
+			f32 change = 0.0f;
+			for (int i = 0; i < 3; i++)
+			{
+				change = std::max(change, std::abs(state.bias[i] - state.stored_bias[i]));
+			}
+
+			if (!state.bias_stored || change >= 0.05f)
+			{
+				if (fusion_store_bias(state.id, state.bias))
+				{
+					for (int i = 0; i < 3; i++)
+					{
+						state.stored_bias[i] = state.bias[i];
+					}
+					state.bias_stored = true;
+
+					input_log.notice("MoveFusion: saved gyro bias for controller %s: (%.2f, %.2f, %.2f), temperature=%d",
+						state.id, state.bias[0], state.bias[1], state.bias[2], static_cast<s32>(move_data.temperature));
+				}
+				else
+				{
+					input_log.error("MoveFusion: failed to save the gyro bias to '%s'", fusion_bias_file_path());
+				}
+			}
+		}
+
 		for (int i = 0; i < 3; i++)
 		{
 			gyro[i] -= state.bias[i];
@@ -1383,11 +1574,11 @@ void PadDevice::update_orientation(ps_move_data& move_data)
 	{
 		state.last_log_time_us = now_us;
 
-		input_log.notice("MoveFusion: player=%d, gravity=%d, still=%d (%.2fs), bias_acquired=%d, accel=(%.3f, %.3f, %.3f) |%.3f|, gyro_raw_lp=(%.2f, %.2f, %.2f), bias=(%.2f, %.2f, %.2f), gyro_dev=%.2f, accel_dev=%.3f, quat=(%.3f, %.3f, %.3f, %.3f)",
-			static_cast<u32>(player_id), static_cast<u32>(use_gravity), static_cast<u32>(state.is_still), state.still_timer, static_cast<u32>(state.bias_acquired),
+		input_log.notice("MoveFusion: player=%d, id=%s, gravity=%d, still=%d (%.2fs), bias_acquired=%d, accel=(%.3f, %.3f, %.3f) |%.3f|, gyro_raw_lp=(%.2f, %.2f, %.2f), bias=(%.2f, %.2f, %.2f), gyro_dev=%.2f, accel_dev=%.3f, quat=(%.3f, %.3f, %.3f, %.3f), temperature=%d",
+			static_cast<u32>(player_id), state.id, static_cast<u32>(use_gravity), static_cast<u32>(state.is_still), state.still_timer, static_cast<u32>(state.bias_acquired),
 			accel[0], accel[1], accel[2], accel_norm,
 			state.gyro_lp[0], state.gyro_lp[1], state.gyro_lp[2],
 			state.bias[0], state.bias[1], state.bias[2],
-			gyro_dev, accel_dev, qx, qy, qz, qw);
+			gyro_dev, accel_dev, qx, qy, qz, qw, static_cast<s32>(move_data.temperature));
 	}
 }
