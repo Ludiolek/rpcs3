@@ -1878,6 +1878,13 @@ static inline void pos_to_gem_state(u32 gem_num, gem_config::gem_controller& con
 	gem_state->pos[2] = controller.distance_mm;
 	gem_state->pos[3] = 0.f;
 
+	// Patched build: smooth the camera position before anything else is derived from it.
+	// This also updates the velocity. The second call further below is then a no-op for this frame.
+	if constexpr (!ps_move_data::use_imu_for_velocity)
+	{
+		move_data.update_velocity(shared_data.frame_timestamp_us, gem_state->pos);
+	}
+
 	// Calculate orientation
 	ps_move_data::vect<4> quat = move_data.quaternion;
 
