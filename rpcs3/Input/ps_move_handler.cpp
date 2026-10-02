@@ -6,6 +6,9 @@
 
 LOG_CHANNEL(move_log, "Move");
 
+// Defined in Emu/Io/PadHandler.cpp. Lets the motion sensor fusion remember the gyro bias of each controller.
+void ps_move_set_fusion_device_id(const PadDevice* device, std::string_view serial);
+
 using namespace reports;
 
 namespace
@@ -344,6 +347,8 @@ void ps_move_handler::check_add_device(hid_device* hidDevice, hid_enumerated_dev
 	std::string serial;
 	for (wchar_t ch : wide_serial)
 		serial += static_cast<uchar>(ch);
+
+	ps_move_set_fusion_device_id(device, serial);
 
 	move_log.success("Added device: serial='%s', path='%s'", serial, device->path);
 }
